@@ -296,7 +296,8 @@ func testJoinBlocks(r *Harness, t *testing.T) {
 	blocksSynced := make(chan struct{})
 	go func() {
 		if err := JoinNodes(nodeSlice, Blocks); err != nil {
-			t.Fatalf("unable to join node on blocks: %v", err)
+			t.Errorf("unable to join node on blocks: %v", err)
+			return
 		}
 		blocksSynced <- struct{}{}
 	}()
