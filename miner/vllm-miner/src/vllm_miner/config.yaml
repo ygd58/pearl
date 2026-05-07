@@ -14,7 +14,9 @@ matrix_multiplication:
   #   so the PoUW kernel never fires in that phase. During prefill, m equals the
   #   number of prompt tokens batched together. Reaching m>=1024 requires either
   #   very large batch sizes or a mining pool that aggregates prefill work across
-  #   many concurrent users.
+  #   many concurrent users. vLLM's continuous batching will naturally combine
+  #   shorter prompts (e.g. coding sessions, synthetic workloads) into large
+  #   prefill batches that reach this threshold.
   #
   # Lowering min_m below 128 will cause ZK proof generation to fail because the
   # circuit requires a minimum data size of 2^17 bytes.
