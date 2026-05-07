@@ -5,7 +5,19 @@ gateway_socket_path: "/tmp/pearlgw.sock"
 
 # Matrix multiplication configuration
 matrix_multiplication:
-  # Use noisy GEMM when N and K dimensions are larger than these thresholds, if not use vanilla GEMM
+  # Minimum matrix dimensions required to trigger the PoUW (noisy GEMM) kernel.
+  # All three thresholds (m, n, k) must be met simultaneously; otherwise the
+  # vanilla GEMM kernel is used for standard inference without mining.
+  #
+  # Why min_m=1024:
+  #   During autoregressive decode each step processes m=1 (one token per sequence),
+  #   so the PoUW kernel never fires in that phase. During prefill, m equals the
+  #   number of prompt tokens batched together. Reaching m>=1024 requires either
+  #   very large batch sizes or a mining pool that aggregates prefill work across
+  #   many concurrent users.
+  #
+  # Lowering min_m below 128 will cause ZK proof generation to fail because the
+  # circuit requires a minimum data size of 2^17 bytes.
   use_simplified_gemm:
     min_m: 1024
     min_n: 1024
