@@ -156,6 +156,7 @@ class AsyncLoopManager:
             )
             return
         assert self._cuda_event_queue, "Status check queue not initialized"
+        assert self._loop is not None, "Event loop not initialized"
         self._pending_cuda_events += 1
         self._loop.call_soon_threadsafe(
             self._cuda_event_queue.put_nowait,
@@ -206,7 +207,7 @@ class AsyncLoopManager:
             try:
                 new_mining_job = await asyncio.to_thread(self._client.get_mining_info)
                 if new_mining_job != self._mining_job:
-                    if self._conf.print_header_hash:
+                    if self._conf.print_header_hash and self._mining_job is not None:
                         _LOGGER.info(
                             f"Got mining job - Header Bytes: {self._mining_job.incomplete_header_bytes.hex()}, "
                             f"Target: {self._mining_job.target}"
