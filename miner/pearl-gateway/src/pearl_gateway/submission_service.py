@@ -20,7 +20,7 @@ class SubmissionService:
     def __init__(self, pearl_client: PearlNodeClient, debug_mode: bool = False):
         self.pearl_client = pearl_client
         self.submission_lock = asyncio.Lock()  # Ensure serialized submissions
-        self.submission_log = set()
+        self.submission_log: set[bytes] = set()
         self.debug_mode = debug_mode
         self.submitted_blocks = 0
         self.accepted_blocks = 0

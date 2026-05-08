@@ -20,7 +20,7 @@ class PearlNodeClient:
         self.rpc_url = url
         self.auth = aiohttp.BasicAuth(config.rpc_user, config.rpc_password)
         self.mining_address = config.mining_address
-        self.session = None
+        self.session: aiohttp.ClientSession | None = None
         self.request_id = 0
         self.backoff_time = 1  # Initial backoff time in seconds
         self.max_backoff = 60  # Maximum backoff time in seconds
@@ -44,7 +44,7 @@ class PearlNodeClient:
             await self.session.close()
             self.session = None
 
-    async def _make_rpc_call(self, method: str, params: list = None) -> dict[str, Any]:
+    async def _make_rpc_call(self, method: str, params: list[Any] | None = None) -> dict[str, Any]:
         """Make a JSON-RPC call to the Pearl node."""
         if not self.session:
             self.session = self._create_session()

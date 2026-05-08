@@ -27,7 +27,7 @@ class TemplateScheduler:
         self.work_cache = work_cache
         self.refresh_interval = config.refresh_interval_seconds
         self.running = False
-        self.last_refresh_time = 0
+        self.last_refresh_time: float = 0.0
         self.refresh_task: asyncio.Task | None = None
 
     async def start(self):
