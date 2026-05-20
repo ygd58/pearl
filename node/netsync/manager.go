@@ -51,6 +51,10 @@ const (
 	// syncPeerCooldown is how long an address that stalled as syncnode
 	// is excluded from re-selection.
 	syncPeerCooldown = 10 * time.Minute
+
+	// lowQualityStrikeLimit is the strike count at which a peer is
+	// downgraded back to low-quality (see nonTipStrikes).
+	lowQualityStrikeLimit = 5
 )
 
 // zeroHash is the zero value hash (all zeros).  It is defined as a convenience.
@@ -156,6 +160,26 @@ type peerSyncState struct {
 	requestQueue    []*wire.InvVect
 	requestedTxns   map[chainhash.Hash]struct{}
 	requestedBlocks map[chainhash.Hash]struct{}
+
+	// nonTipStrikes counts consecutive non-tip-extending blocks from
+	// this peer. Starts at lowQualityStrikeLimit for inbound peers, 0
+	// for outbound peers; resets to 0 on a tip-extending block;
+	// saturates on each accepted-but-not-tip one.
+	nonTipStrikes int
+}
+
+// isPeerHighQuality reports whether the peer should bypass the
+// inv -> getheaders -> getdata gate.
+func isPeerHighQuality(state *peerSyncState) bool {
+	return state.nonTipStrikes < lowQualityStrikeLimit
+}
+
+// strikeNonTip records that a block from this peer did not extend
+// our tip (orphan, rejected, or accepted on a side chain).
+func (s *peerSyncState) strikeNonTip() {
+	if s.nonTipStrikes < lowQualityStrikeLimit {
+		s.nonTipStrikes++
+	}
 }
 
 // limitAdd is a helper function for maps that require a maximum limit by
@@ -352,12 +376,7 @@ func (sm *SyncManager) startSync() {
 	// to send.
 	sm.requestedBlocks = make(map[chainhash.Hash]struct{})
 
-	locator, err := sm.chain.LatestBlockLocator()
-	if err != nil {
-		log.Errorf("Failed to get block locator for the "+
-			"latest block: %v", err)
-		return
-	}
+	locator, _ := sm.chain.LatestBlockLocator()
 
 	log.Infof("Syncing to block height %d from peer %v",
 		bestPeer.LastBlock(), bestPeer.Addr())
@@ -383,7 +402,7 @@ func (sm *SyncManager) startSync() {
 		best.Height < sm.nextCheckpoint.Height &&
 		sm.chainParams != &chaincfg.RegressionNetParams {
 
-		bestPeer.PushGetHeadersMsg(locator, sm.nextCheckpoint.Hash)
+		bestPeer.PushGetHeadersMsg(locator, sm.nextCheckpoint.Hash, true)
 		sm.headersFirstMode = true
 		log.Infof("Downloading headers for blocks %d to "+
 			"%d from peer %s", best.Height+1,
@@ -470,10 +489,15 @@ func (sm *SyncManager) handleNewPeerMsg(peer *peerpkg.Peer) {
 
 	// Initialize the peer state.
 	isSyncCandidate := sm.isSyncCandidate(peer)
+	initialStrikes := lowQualityStrikeLimit
+	if !peer.Inbound() {
+		initialStrikes = 0
+	}
 	sm.peerStates[peer] = &peerSyncState{
 		syncCandidate:   isSyncCandidate,
 		requestedTxns:   make(map[chainhash.Hash]struct{}),
 		requestedBlocks: make(map[chainhash.Hash]struct{}),
+		nonTipStrikes:   initialStrikes,
 	}
 
 	// Start syncing by choosing the best candidate if needed.
@@ -759,7 +783,15 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) error {
 
 	// Process the block to include validation, best chain selection, orphan
 	// handling, etc.
-	_, isOrphan, err := sm.chain.ProcessBlock(bmsg.block, behaviorFlags)
+	isMainChain, isOrphan, err := sm.chain.ProcessBlock(bmsg.block, behaviorFlags)
+
+	// Strike accounting: a single decision point based on ProcessBlock's
+	// result rather than re-deriving it from chain state.
+	if isMainChain {
+		state.nonTipStrikes = 0
+	} else if ruleErr, ok := err.(blockchain.RuleError); !ok || ruleErr.ErrorCode != blockchain.ErrDuplicateBlock {
+		state.strikeNonTip()
+	}
 	if err != nil {
 		// When the error is a rule error, it means the block was simply
 		// rejected as opposed to something actually going wrong, so log
@@ -814,13 +846,8 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) error {
 		}
 
 		orphanRoot := sm.chain.GetOrphanRoot(blockHash)
-		locator, err := sm.chain.LatestBlockLocator()
-		if err != nil {
-			log.Warnf("Failed to get block locator for the "+
-				"latest block: %v", err)
-		} else {
-			peer.PushGetBlocksMsg(locator, orphanRoot)
-		}
+		locator, _ := sm.chain.LatestBlockLocator()
+		peer.PushGetBlocksMsg(locator, orphanRoot)
 	} else {
 		if peer == sm.syncPeer {
 			sm.lastProgressTime = time.Now()
@@ -882,7 +909,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) error {
 	sm.nextCheckpoint = sm.findNextHeaderCheckpoint(prevHeight)
 	if sm.nextCheckpoint != nil {
 		locator := blockchain.BlockLocator([]*chainhash.Hash{prevHash})
-		err := peer.PushGetHeadersMsg(locator, sm.nextCheckpoint.Hash)
+		err := peer.PushGetHeadersMsg(locator, sm.nextCheckpoint.Hash, true)
 		if err != nil {
 			log.Warnf("Failed to send getheaders message to "+
 				"peer %s: %v", peer.Addr(), err)
@@ -960,35 +987,63 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 	}
 }
 
-// handleHeadersMsg handles block header messages from all peers.  Headers are
-// requested when performing a headers-first sync.
+// handleHeadersMsg handles a headers message: either headers-first
+// checkpoint sync, or the low-quality inv -> getheaders -> getdata path.
 func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	peer := hmsg.peer
-	_, exists := sm.peerStates[peer]
+	state, exists := sm.peerStates[peer]
 	if !exists {
 		log.Warnf("Received headers message from unknown peer %s", peer)
 		return
 	}
 
-	// The remote peer is misbehaving if we didn't request headers.
 	msg := hmsg.headers
 	numHeaders := len(msg.Headers)
-	if !sm.headersFirstMode {
-		log.Warnf("Got %d unrequested headers from %s -- "+
-			"disconnecting", numHeaders, peer.Addr())
-		peer.Disconnect()
-		return
-	}
 
-	// Only the sync peer may drive the headers-first state machine;
-	// other peers' headers can race sm.headerList and break linkage for
-	// the sync peer's legitimate batches.
-	if peer != sm.syncPeer {
-		return
-	}
-
-	// Nothing to do for an empty headers message.
+	// Nothing to do for an empty headers message. In non-headers-first
+	// mode the peer may be replying to a getheaders probe we sent after
+	// an inv; an empty response is legitimate (e.g. our tip advanced
+	// between probe and reply) and cheap on both sides, so no penalty is applied.
 	if numHeaders == 0 {
+		return
+	}
+
+	// Non-headers-first: low-quality inv response (or a future BIP130
+	// announce). Require the batch root (headers[0].PrevBlock) to be a
+	// block we already have, then request getdata for any headers we
+	// don't yet have and haven't already requested.
+	if !sm.headersFirstMode {
+		if msg.Headers[0].BlockCertificate() != nil {
+			log.Warnf("Peer %s sent certificate-bearing headers outside "+
+				"headersFirst mode -- disconnecting", peer.Addr())
+			peer.Disconnect()
+			return
+		}
+
+		root := msg.Headers[0].BlockHeader.PrevBlock
+		if have, err := sm.chain.HaveBlock(&root); err != nil || !have {
+			return
+		}
+
+		gdmsg := wire.NewMsgGetData()
+		for _, h := range msg.Headers {
+			hash := h.BlockHeader.BlockHash()
+			if _, requested := sm.requestedBlocks[hash]; requested {
+				continue
+			}
+			if have, err := sm.chain.HaveBlock(&hash); err != nil || have {
+				continue
+			}
+			limitAdd(sm.requestedBlocks, hash, maxRequestedBlocks)
+			limitAdd(state.requestedBlocks, hash, maxRequestedBlocks)
+			gdmsg.AddInvVect(wire.NewInvVect(wire.InvTypeWitnessBlock, &hash))
+		}
+		if len(gdmsg.InvList) > 0 {
+			peer.QueueMessage(gdmsg, nil)
+		}
+		return
+	}
+	if peer != sm.syncPeer {
 		return
 	}
 
@@ -1090,7 +1145,7 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 	// headers starting from the latest known header and ending with the
 	// next checkpoint.
 	locator := blockchain.BlockLocator([]*chainhash.Hash{finalHash})
-	err := peer.PushGetHeadersMsg(locator, sm.nextCheckpoint.Hash)
+	err := peer.PushGetHeadersMsg(locator, sm.nextCheckpoint.Hash, true)
 	if err != nil {
 		log.Warnf("Failed to send getheaders message to "+
 			"peer %s: %v", peer.Addr(), err)
@@ -1225,6 +1280,19 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 		}
 	}
 
+	// Low-quality + current peers route block announcements through a
+	// single cert-less getheaders probe anchored on the last announced
+	// block; handleHeadersMsg converts a valid response into getdata.
+	// Skip the probe when we already have the anchor (the peer has
+	// nothing new for us in this batch).
+	if lastBlock >= 0 && sm.current() && !isPeerHighQuality(state) {
+		if have, _ := sm.haveInventory(invVects[lastBlock]); !have {
+			locator, _ := sm.chain.LatestBlockLocator()
+			_ = peer.PushGetHeadersMsg(
+				locator, &invVects[lastBlock].Hash, false)
+		}
+	}
+
 	// Request the advertised inventory if we don't already have it.  Also,
 	// request parent blocks of orphans if we receive one we already have.
 	// Finally, attempt to detect potential stalls due to long side chains
@@ -1246,6 +1314,15 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 
 		// Ignore inventory when we're in headers-first mode.
 		if sm.headersFirstMode {
+			continue
+		}
+
+		// Block invs from low-quality + current peers are handled by
+		// the probe dispatched above. Skip the per-inv block path
+		// (including IsKnownOrphan retry and long-side-chain stall
+		// detection) so untrusted peers can't drive our state machine.
+		if iv.Type == wire.InvTypeBlock && sm.current() &&
+			!isPeerHighQuality(state) {
 			continue
 		}
 
@@ -1287,13 +1364,7 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 				// up to the root of the orphan that just came
 				// in.
 				orphanRoot := sm.chain.GetOrphanRoot(&iv.Hash)
-				locator, err := sm.chain.LatestBlockLocator()
-				if err != nil {
-					log.Errorf("PEER: Failed to get block "+
-						"locator for the latest block: "+
-						"%v", err)
-					continue
-				}
+				locator, _ := sm.chain.LatestBlockLocator()
 				peer.PushGetBlocksMsg(locator, orphanRoot)
 				continue
 			}
